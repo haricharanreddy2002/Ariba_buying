@@ -1,4 +1,4 @@
-import nest_asyncio
+import nest_asyncio 
 import chromadb
 import os
 import json
@@ -20,12 +20,12 @@ from datetime import datetime
 from fastapi import FastAPI
 from dotenv import load_dotenv
 from pydantic import BaseModel
-from pdf2image import convert_from_path
-import pandas as pd
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import codecs
+import asyncio
+
 
 # Load environment variables
 load_dotenv()
@@ -37,65 +37,15 @@ OUTPUT_DIR = "outputs"
 IMAGE_DIR = os.path.join(OUTPUT_DIR, "images")  # outputs/images
 AUDIO_DIR = os.path.join(OUTPUT_DIR, "audio")   # outputs/audio
 
-os.makedirs(IMAGE_DIR, exist_ok=True)  # Creates if missing, no error if exists
-os.makedirs(AUDIO_DIR, exist_ok=True)  # Same for audio
+os.makedirs(IMAGE_DIR, exist_ok=True)
+os.makedirs(AUDIO_DIR, exist_ok=True)
 
 # In-memory cache for query results
 QUERY_CACHE = {}
 
 # Metadata and JSON files
 METADATA_FILE = "pdf_metadata.json"
-JSON_FILE = "query_responses_8.json"
-
-def multiple_image(query):
-    page_list = []
-    excel_path = 'cliplevel.xlsx'
-    output_folder = 'output_images'
-    poppler_path = r"poppler-24.08.0/Library/bin/"
-
-    os.makedirs(output_folder, exist_ok=True)
-
-    df = pd.read_excel(excel_path)
-
-    query = query.lower()
-    image_list = []
-    for _, row in df.iterrows():
-        question = str(row['Question']).strip()
-        if question == query:
-            pdf_path = str(row['PDF_path']).strip()
-            page_numbers = str(row['page_no']).strip()
-
-            if not question or not pdf_path or not page_numbers:
-                continue
-
-            if not os.path.isfile(pdf_path):
-                print(f"❌ Missing PDF: {pdf_path}")
-                continue
-
-            try:
-                page_list = [int(p.strip()) for p in page_numbers.split(',')]
-            except ValueError:
-                print(f"❌ Invalid page numbers: {page_numbers}")
-                continue
-                        
-            for page_num in page_list:
-                try:
-                    images = convert_from_path(
-                        pdf_path,
-                        first_page=page_num,
-                        last_page=page_num,
-                        poppler_path=poppler_path
-                    )
-                    for img in images:
-                        safe_question = "".join(c if c.isalnum() else "_" for c in question)[:50]
-                        img_name = f"{safe_question}_page_{page_num}.png"
-                        img.save(os.path.join(output_folder, img_name))
-                        print(f"✅ Saved: {img_name}")
-                        img_name = f"https://mjnsupport.chervicaon.com/output_images/{img_name}"
-                        image_list.append(img_name)
-                except Exception as e:
-                    print(f"❌ Error processing {pdf_path} page {page_num}: {e}")
-    return page_list, image_list
+JSON_FILE = "query_responses_2.json"
 
 # Pydantic model for query input
 class QueryInput(BaseModel):
@@ -143,15 +93,13 @@ def format_response(response_text, file_path, query_text):
     query_lower = query_text.lower()
     response_str = response_text['text'].strip()
 
-    # Handle approval flow queries with "clip level"
-    if "approval" in query_lower and "clip level" in query_lower:
+    # Handle approval flow queries
+    if "approval" in query_lower:
         if "no specific information" in response_str.lower():
             context = response_text['metadata'].get('context', response_str)
-            # Look for monetary amounts or thresholds in the context
             amounts = re.findall(r'\b\d{1,3}(?:,\d{3})*(?:\.\d+)?\b', context)
             if amounts:
-                # Infer clip level as a threshold and describe the approval flow
-                return (f"While 'clip level' is not explicitly mentioned, the approval flow likely involves thresholds based on amounts like {', '.join(amounts)}. The context mentions approval chains with first, second, and third approvers, suggesting that for amounts above certain thresholds, additional approvals may be required."), page_number
+                return (f"The approval flow likely involves thresholds based on amounts like {', '.join(amounts)}. The context mentions approval chains with first, second, and third approvers, suggesting that for amounts above certain thresholds, additional approvals may be required."), page_number
         return response_str, page_number
 
     # Handle dashboard-related queries
@@ -168,36 +116,47 @@ def format_response(response_text, file_path, query_text):
         name = match.group(0).strip() if match else "Not specified"
         return name, page_number
     elif any(keyword in query_lower for keyword in ["process", "steps", "flow"]):
-        # Remove introductory text like "The buying process consists of..."
         response_str = re.sub(
             r'^(.*?following steps:?)\s*\n*',
             '',
             response_str,
             flags=re.IGNORECASE | re.DOTALL
         ).strip()
-        # Split on common step prefixes
         steps = re.split(
             r'\n*(?:\d+\.\s*|\(\d+\)\s*|Step \d+:\s*|step \d+:\s*)',
             response_str,
             flags=re.IGNORECASE
         )
-        steps = [step.strip() for step in steps if step.strip()]  # Remove empty steps
+        steps = [step.strip() for step in steps if step.strip()]
         if steps:
             formatted_steps = [f"step {i+1}: {step}" for i, step in enumerate(steps)]
             return "\n".join(formatted_steps), page_number
         return "No specific steps found in the provided context.", page_number
+
+    # Remove unwanted phrases like "In the context provided" or "Based on the context"
+    response_str = re.sub(
+        r'^(In the context provided|Based on the context|The context mentions|As per the context|According to the context)[,\s]*',
+        '',
+        response_str,
+        flags=re.IGNORECASE | re.DOTALL
+    ).strip()
+
+    # Capitalize the first letter of the response after removing the phrase
+    if response_str:
+        response_str = response_str[0].upper() + response_str[1:]
+
     return response_str, page_number
 
 # Function to handle the query for a single PDF
 def query_document(vector_index, query_text, llm, file_path):
     try:
         qa_template = PromptTemplate(
-            "Given the context, provide a precise answer to the question. Ensure the answer is directly relevant to the query. For approval-related queries involving terms like 'clip level', interpret 'clip level' as a possible monetary threshold for approvals and look for related information (e.g., amounts, approval chains, or levels of approvers). If the question involves a user dashboard or tracking procurement tasks, look for related information (e.g., visibility into processes, task statuses, or system features) and infer how a dashboard might assist. For process-related queries, return the relevant steps if present, or infer a general process flow if no exact details are found. If no relevant information is available, return 'No specific information found.' Context: {context_str}\nQuestion: {query_str}\nAnswer:"
+            "Given the context, provide a precise answer to the question. Ensure the answer is directly relevant to the query. For approval-related queries, look for information about approval chains, thresholds, or levels of approvers, and describe the process if found. If the question involves a user dashboard or tracking procurement tasks, look for related information (e.g., visibility into processes, task statuses, or system features) and infer how a dashboard might assist. For process-related queries, return the relevant steps if present, or infer a general process flow if no exact details are found. If no relevant information is available, return 'No specific information found.' Context: {context_str}\nQuestion: {query_str}\nAnswer:"
         )
         query_engine = vector_index.as_query_engine(
             llm=llm,
             response_mode="compact",
-            similarity_top_k=30,  # Increased to retrieve more context
+            similarity_top_k=30,
             text_qa_template=qa_template
         )
         response = query_engine.query(query_text)
@@ -213,10 +172,6 @@ def query_document(vector_index, query_text, llm, file_path):
         print(f"Retrieved context for {file_path} (page {page_number}, score {score}):\n{response.source_nodes[0].text[:500]}")
         metadata['context'] = response.source_nodes[0].text
         formatted_response, _ = format_response({"text": str(response), "metadata": metadata}, file_path, query_text)
-        # Remove "Based on the provided context" and capitalize first letter
-        formatted_response = re.sub(r'^(Based on the provided context,?\s*)', '', formatted_response, flags=re.IGNORECASE)
-        if formatted_response:
-            formatted_response = formatted_response[0].upper() + formatted_response[1:]
         return formatted_response, page_number, score
     except Exception as e:
         print(f"Error querying document {file_path}: {e}")
@@ -229,8 +184,8 @@ def extract_text_from_image(pdf_path, page_number):
         page = doc.load_page(page_number - 1)
         pix = page.get_pixmap()
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        img = img.convert("L")  # Convert to grayscale
-        img = img.point(lambda x: 0 if x < 128 else 255, "1")  # Binarize
+        img = img.convert("L")
+        img = img.point(lambda x: 0 if x < 128 else 255, "1")
         text = pytesseract.image_to_string(img)
         print(f"OCR Extracted Text for {pdf_path} (page {page_number}):\n{text[:500]}")
         return text
@@ -319,7 +274,6 @@ def check_cached_query(query_text, max_age_hours=24):
     cache_key = query_text_lower
     if cache_key in QUERY_CACHE:
         print(f"Returning in-memory cached response for query: {query_text}")
-        # Ensure cached response has full URLs
         cached = QUERY_CACHE[cache_key]
         return {
             "response": cached["response"],
@@ -338,7 +292,6 @@ def check_cached_query(query_text, max_age_hours=24):
                 age = (datetime.now() - timestamp).total_seconds() / 3600
                 if age < max_age_hours:
                     print(f"Returning JSON-cached response for query: {query_text}")
-                    # Ensure full URLs in cached response
                     cached_response = {
                         "response": entry["response"],
                         "page_number": entry["page_number"],
@@ -444,16 +397,22 @@ app.mount("/uploads", StaticFiles(directory="uploads"), name="pdf")
 @app.post("/query")
 async def handle_query(value: str):
     query = value
-    response = main_method(query)
-    page_list, image_list = multiple_image(query)
-    if page_list:
-        page = ",".join(str(item) for item in page_list).replace('"', '')
-        response['page_number'] = page 
-        img_string = ", ".join(image_list)
-        response['image_path'] = img_string
-    if "steps:" in response['response'].lower():
-        response['response'] = response['response'].replace("\n\n", "\n")
-    return response
-
+    try:
+        # Set a timeout of 45 seconds for the main_method
+        async with asyncio.timeout(45):
+            response = main_method(query)
+            if "steps:" in response['response'].lower():
+                response['response'] = response['response'].replace("\n\n", "\n")
+            return response
+    except asyncio.TimeoutError:
+        # Return a response if the query takes longer than 45 seconds
+        return {
+            "query": query,
+            "response": "Can we be more specific?",
+            "page_number": None,
+            "image_path": None,
+            "audio_path": None,
+            "pdf_path": None,
+            "timestamp": datetime.now().isoformat()}
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.1", port=8000)
